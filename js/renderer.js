@@ -19,10 +19,69 @@ export const MAX_NOTE_SAMPLES = 5210;
 export const RELEASE_PROJECTION_ASPECT = 1.75;
 export const RELEASE_SHUTTER_SECONDS = 0.041748046875; // float 0x3d2b0000
 
+const RENDER_ASPECT = RENDER_WIDTH / RENDER_HEIGHT;
 const NUM_ROWS = 114;
 const CAMERA_NEAR = 0.03125;
 const CAMERA_FAR = 256.0;
 const D3DX_PI = Math.fround(3.141592654);
+
+function positiveFiniteOrOne(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : 1;
+}
+
+function fitRenderSizeWithinLimits(width, height, maxWidth, maxHeight) {
+  const requestedWidth = Math.floor(Number(width));
+  const requestedHeight = Math.floor(Number(height));
+  const widthLimit = Number(maxWidth);
+  const heightLimit = Number(maxHeight);
+
+  if (
+    !Number.isFinite(requestedWidth)
+    || !Number.isFinite(requestedHeight)
+    || requestedWidth < 1
+    || requestedHeight < 1
+  ) {
+    throw new RangeError('Render dimensions must be at least one pixel');
+  }
+  if (
+    widthLimit < 1
+    || heightLimit < 1
+    || Number.isNaN(widthLimit)
+    || Number.isNaN(heightLimit)
+  ) {
+    throw new RangeError('Render limits must be at least one pixel');
+  }
+
+  const scale = Math.min(1, widthLimit / requestedWidth, heightLimit / requestedHeight);
+  return {
+    width: Math.max(1, Math.floor(requestedWidth * scale)),
+    height: Math.max(1, Math.floor(requestedHeight * scale)),
+  };
+}
+
+/** Selects a contained 16:9 physical-pixel size within the supplied limits. */
+export function getAdaptiveRenderSize(
+  viewportWidth,
+  viewportHeight,
+  pixelRatio = 1,
+  maxWidth = Number.POSITIVE_INFINITY,
+  maxHeight = Number.POSITIVE_INFINITY,
+) {
+  const dpr = positiveFiniteOrOne(pixelRatio);
+  const availableWidth = positiveFiniteOrOne(viewportWidth) * dpr;
+  const availableHeight = positiveFiniteOrOne(viewportHeight) * dpr;
+  let width = Math.round(availableWidth);
+  let height = Math.round(availableHeight);
+
+  if (availableWidth / availableHeight > RENDER_ASPECT) {
+    width = Math.round(availableHeight * RENDER_ASPECT);
+  } else {
+    height = Math.round(availableWidth / RENDER_ASPECT);
+  }
+
+  return fitRenderSizeWithinLimits(width, height, maxWidth, maxHeight);
+}
 
 const DEFAULT_Q = new Float32Array([
   98 / 256, 0 / 256, 1 / 4096, 53 / 96,
@@ -114,6 +173,19 @@ function bindTexture(gl, unit, texture) {
   gl.bindTexture(gl.TEXTURE_2D, texture);
 }
 
+function throwOnGlError(gl, label) {
+  const error = gl.getError();
+  if (error !== gl.NO_ERROR) {
+    throw new Error(`${label} failed (WebGL error 0x${error.toString(16)})`);
+  }
+}
+
+function discardPendingGlErrors(gl) {
+  while (gl.getError() !== gl.NO_ERROR) {
+    // Drain the global queue so the allocation checks have a clean boundary.
+  }
+}
+
 function createTexture(gl, {
   width,
   height,
@@ -122,44 +194,126 @@ function createTexture(gl, {
   type,
   data = null,
   wrap = gl.REPEAT,
+  label = 'texture',
 }) {
   const texture = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_BASE_LEVEL, 0);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, 0);
-  gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, width, height, 0, format, type, data);
-  return texture;
+  if (!texture) throw new Error(`Unable to create ${label}`);
+  try {
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_BASE_LEVEL, 0);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, 0);
+    gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, width, height, 0, format, type, data);
+    throwOnGlError(gl, `${label} allocation`);
+    return texture;
+  } catch (error) {
+    gl.deleteTexture(texture);
+    throw error;
+  }
 }
 
 function createFramebuffer(gl, texture, depth = null, label = 'framebuffer') {
   const framebuffer = gl.createFramebuffer();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-  gl.framebufferTexture2D(
-    gl.FRAMEBUFFER,
-    gl.COLOR_ATTACHMENT0,
-    gl.TEXTURE_2D,
-    texture,
-    0,
-  );
-  if (depth) {
-    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+  if (!framebuffer) throw new Error(`Unable to create ${label}`);
+  try {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D,
+      texture,
+      0,
+    );
+    if (depth) {
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+    }
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      throw new Error(`${label} is incomplete (WebGL status 0x${status.toString(16)})`);
+    }
+    return framebuffer;
+  } catch (error) {
+    gl.deleteFramebuffer(framebuffer);
+    throw error;
   }
-  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-  if (status !== gl.FRAMEBUFFER_COMPLETE) {
-    throw new Error(`${label} is incomplete (WebGL status 0x${status.toString(16)})`);
-  }
-  return framebuffer;
 }
 
-function createDepthBuffer(gl, width, height) {
+function createDepthBuffer(gl, width, height, label = 'depth buffer') {
   const depth = gl.createRenderbuffer();
-  gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
-  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, width, height);
-  return depth;
+  if (!depth) throw new Error(`Unable to create ${label}`);
+  try {
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, width, height);
+    throwOnGlError(gl, `${label} allocation`);
+    return depth;
+  } catch (error) {
+    gl.deleteRenderbuffer(depth);
+    throw error;
+  }
+}
+
+function deleteRenderTargets(gl, targets) {
+  if (!targets) return;
+  gl.deleteFramebuffer(targets.gBufferFramebuffer);
+  gl.deleteFramebuffer(targets.colorFramebuffer);
+  gl.deleteRenderbuffer(targets.depthBuffer);
+  gl.deleteTexture(targets.gBufferTexture);
+  gl.deleteTexture(targets.colorTexture);
+}
+
+function createRenderTargets(gl, width, height) {
+  const targets = {
+    gBufferTexture: null,
+    colorTexture: null,
+    depthBuffer: null,
+    gBufferFramebuffer: null,
+    colorFramebuffer: null,
+  };
+
+  try {
+    targets.gBufferTexture = createTexture(gl, {
+      width,
+      height,
+      internalFormat: gl.RGBA32F,
+      format: gl.RGBA,
+      type: gl.FLOAT,
+      wrap: gl.REPEAT,
+      label: `world-position texture (${width}x${height})`,
+    });
+    targets.colorTexture = createTexture(gl, {
+      width,
+      height,
+      internalFormat: gl.RGBA8,
+      format: gl.RGBA,
+      type: gl.UNSIGNED_BYTE,
+      wrap: gl.CLAMP_TO_EDGE,
+      label: `lighting texture (${width}x${height})`,
+    });
+    targets.depthBuffer = createDepthBuffer(gl, width, height, `depth buffer (${width}x${height})`);
+    targets.gBufferFramebuffer = createFramebuffer(
+      gl,
+      targets.gBufferTexture,
+      targets.depthBuffer,
+      `world-position G-buffer (${width}x${height})`,
+    );
+    targets.colorFramebuffer = createFramebuffer(
+      gl,
+      targets.colorTexture,
+      null,
+      `RGBA8 lighting target (${width}x${height})`,
+    );
+    return targets;
+  } catch (error) {
+    deleteRenderTargets(gl, targets);
+    throw error;
+  } finally {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
 }
 
 /**
@@ -550,18 +704,32 @@ export class Renderer {
     const canvas = suppliedContext ? canvasOrContext.canvas : canvasOrContext;
     const gl = suppliedContext ? canvasOrContext : canvas?.getContext?.('webgl2', contextAttributes);
     if (!gl) throw new Error('Elevated requires WebGL2');
+    if (!canvas || !('width' in canvas) || !('height' in canvas)) {
+      throw new Error('Elevated requires a resizable WebGL canvas');
+    }
     if (!gl.getExtension('EXT_color_buffer_float')) {
       throw new Error('Elevated requires EXT_color_buffer_float for its RGBA32F camera/G-buffer');
     }
 
     this.gl = gl;
     this.canvas = canvas;
-    this.width = options.width ?? RENDER_WIDTH;
-    this.height = options.height ?? RENDER_HEIGHT;
-    if (canvas && 'width' in canvas) {
-      canvas.width = this.width;
-      canvas.height = this.height;
-    }
+    const viewportLimits = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+    const textureLimit = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const renderbufferLimit = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
+    this.maxRenderWidth = Math.min(textureLimit, renderbufferLimit, viewportLimits[0]);
+    this.maxRenderHeight = Math.min(textureLimit, renderbufferLimit, viewportLimits[1]);
+    const initialSize = fitRenderSizeWithinLimits(
+      options.width ?? RENDER_WIDTH,
+      options.height ?? RENDER_HEIGHT,
+      this.maxRenderWidth,
+      this.maxRenderHeight,
+    );
+    this.width = initialSize.width;
+    this.height = initialSize.height;
+    canvas.width = this.width;
+    canvas.height = this.height;
+    this.width = gl.drawingBufferWidth;
+    this.height = gl.drawingBufferHeight;
 
     this.q = new Float32Array(64);
     this.q.set(DEFAULT_Q);
@@ -602,22 +770,7 @@ export class Renderer {
       type: gl.FLOAT,
       data: createNoiseData(options.noiseSeed ?? NOISE_SEED),
       wrap: gl.REPEAT,
-    });
-    this.gBufferTexture = createTexture(gl, {
-      width: this.width,
-      height: this.height,
-      internalFormat: gl.RGBA32F,
-      format: gl.RGBA,
-      type: gl.FLOAT,
-      wrap: gl.REPEAT,
-    });
-    this.colorTexture = createTexture(gl, {
-      width: this.width,
-      height: this.height,
-      internalFormat: gl.RGBA8,
-      format: gl.RGBA,
-      type: gl.UNSIGNED_BYTE,
-      wrap: gl.CLAMP_TO_EDGE,
+      label: 'noise texture',
     });
     this.cameraTexture = createTexture(gl, {
       width: 2,
@@ -626,16 +779,10 @@ export class Renderer {
       format: gl.RGBA,
       type: gl.FLOAT,
       wrap: gl.CLAMP_TO_EDGE,
+      label: '2x1 camera texture',
     });
 
-    this.depthBuffer = createDepthBuffer(gl, this.width, this.height);
-    this.gBufferFramebuffer = createFramebuffer(
-      gl,
-      this.gBufferTexture,
-      this.depthBuffer,
-      'world-position G-buffer',
-    );
-    this.colorFramebuffer = createFramebuffer(gl, this.colorTexture, null, 'RGBA8 lighting target');
+    Object.assign(this, createRenderTargets(gl, this.width, this.height));
     this.cameraFramebuffer = createFramebuffer(gl, this.cameraTexture, null, '2x1 camera target');
 
     // D3D9 device defaults used by the intro. In particular WebGL defaults to
@@ -663,6 +810,52 @@ export class Renderer {
     }
     gl.bindVertexArray(null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  /** Reallocates full-frame attachments and reports whether the size changed. */
+  resize(width, height) {
+    const gl = this.gl;
+    const targetSize = fitRenderSizeWithinLimits(
+      width,
+      height,
+      this.maxRenderWidth,
+      this.maxRenderHeight,
+    );
+    if (gl.isContextLost()) throw new Error('Unable to resize a lost WebGL context');
+    if (targetSize.width === this.width && targetSize.height === this.height) return false;
+
+    discardPendingGlErrors(gl);
+    const nextTargets = createRenderTargets(gl, targetSize.width, targetSize.height);
+    const previousCanvasWidth = this.canvas.width;
+    const previousCanvasHeight = this.canvas.height;
+    try {
+      this.canvas.width = targetSize.width;
+      this.canvas.height = targetSize.height;
+      if (
+        gl.drawingBufferWidth !== targetSize.width
+        || gl.drawingBufferHeight !== targetSize.height
+      ) {
+        throw new Error(`Unable to create a ${targetSize.width}x${targetSize.height} drawing buffer`);
+      }
+    } catch (error) {
+      deleteRenderTargets(gl, nextTargets);
+      this.canvas.width = previousCanvasWidth;
+      this.canvas.height = previousCanvasHeight;
+      throw error;
+    }
+
+    const previousTargets = {
+      gBufferTexture: this.gBufferTexture,
+      colorTexture: this.colorTexture,
+      depthBuffer: this.depthBuffer,
+      gBufferFramebuffer: this.gBufferFramebuffer,
+      colorFramebuffer: this.colorFramebuffer,
+    };
+    this.width = targetSize.width;
+    this.height = targetSize.height;
+    Object.assign(this, nextTargets);
+    deleteRenderTargets(gl, previousTargets);
+    return true;
   }
 
   _upload(info, matrix = null) {
@@ -867,14 +1060,10 @@ export class Renderer {
     gl.deleteVertexArray(this.terrainVao);
     gl.deleteBuffer(this.terrainVertexBuffer);
     gl.deleteBuffer(this.terrainIndexBuffer);
-    gl.deleteTexture(this.noiseTexture);
-    gl.deleteTexture(this.gBufferTexture);
-    gl.deleteTexture(this.colorTexture);
-    gl.deleteTexture(this.cameraTexture);
-    gl.deleteRenderbuffer(this.depthBuffer);
-    gl.deleteFramebuffer(this.gBufferFramebuffer);
-    gl.deleteFramebuffer(this.colorFramebuffer);
+    deleteRenderTargets(gl, this);
     gl.deleteFramebuffer(this.cameraFramebuffer);
+    gl.deleteTexture(this.noiseTexture);
+    gl.deleteTexture(this.cameraTexture);
   }
 }
 

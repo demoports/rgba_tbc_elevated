@@ -1,5 +1,10 @@
 import { ElevatedAudio, SAMPLE_RATE } from './audio.js';
-import { Renderer } from './renderer.js';
+import {
+  RENDER_HEIGHT,
+  RENDER_WIDTH,
+  Renderer,
+  getAdaptiveRenderSize,
+} from './renderer.js';
 import {
   EXIT_SAMPLE,
   evaluateInstrumentAges,
@@ -18,6 +23,18 @@ const instrumentAges = new Float32Array(8);
 const query = new URLSearchParams(location.search);
 const staticTime = query.get('time');
 
+function readPositiveInteger(name) {
+  const value = Number(query.get(name));
+  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 0;
+}
+
+const queryWidth = readPositiveInteger('width');
+const queryHeight = readPositiveInteger('height');
+const fixedRenderSize = queryWidth || queryHeight ? {
+  width: queryWidth || RENDER_WIDTH,
+  height: queryHeight || RENDER_HEIGHT,
+} : null;
+
 if (staticTime !== null) document.documentElement.dataset.static = 'true';
 
 let renderer;
@@ -30,6 +47,13 @@ let flashTimer = 0;
 let wakeLock = null;
 let wakeLockPending = false;
 let wakeLockGeneration = 0;
+let resizeFrame = 0;
+let pixelRatioQuery = null;
+let measuredPixelRatio = devicePixelRatio;
+const allocationLimit = {
+  width: Number.POSITIVE_INFINITY,
+  height: Number.POSITIVE_INFINITY,
+};
 
 function setStatus(message) {
   status.textContent = message;
@@ -43,7 +67,79 @@ function setBusy(busy) {
   progress.setAttribute('aria-busy', String(busy));
 }
 
+function measureCanvasRenderSize(maxWidth, maxHeight) {
+  measuredPixelRatio = devicePixelRatio;
+  return getAdaptiveRenderSize(
+    canvas.clientWidth || document.documentElement.clientWidth || innerWidth,
+    canvas.clientHeight || document.documentElement.clientHeight || innerHeight,
+    measuredPixelRatio,
+    maxWidth,
+    maxHeight,
+  );
+}
+
+function getTargetRenderSize() {
+  return measureCanvasRenderSize(
+    Math.min(allocationLimit.width, renderer.maxRenderWidth),
+    Math.min(allocationLimit.height, renderer.maxRenderHeight),
+  );
+}
+
+function resizeRenderer() {
+  if (!renderer || fixedRenderSize) return false;
+
+  while (true) {
+    const target = getTargetRenderSize();
+
+    try {
+      return renderer.resize(target.width, target.height);
+    } catch (error) {
+      if (renderer.gl.isContextLost() || target.width <= 1 || target.height <= 1) {
+        console.warn('Unable to resize the Elevated render targets', error);
+        return false;
+      }
+
+      allocationLimit.width = Math.max(1, Math.floor(target.width * 0.75));
+      allocationLimit.height = Math.max(1, Math.floor(target.height * 0.75));
+      console.warn(
+        `Unable to render at ${target.width}x${target.height}; trying `
+          + `${allocationLimit.width}x${allocationLimit.height}`,
+        error,
+      );
+    }
+  }
+}
+
+function scheduleResize() {
+  if (fixedRenderSize || resizeFrame) return;
+  resizeFrame = requestAnimationFrame(() => {
+    resizeFrame = 0;
+    if (!resizeRenderer() || lastRenderedSample < 0) return;
+    if (!canvas.classList.contains('visible')) return;
+    const sample = audio?.state === 'playing' || audio?.state === 'paused'
+      ? audio.getSamplePosition()
+      : lastRenderedSample;
+    renderAt(sample);
+  });
+}
+
+function watchPixelRatio() {
+  if (fixedRenderSize) return;
+  pixelRatioQuery?.removeEventListener('change', handlePixelRatioChange);
+  pixelRatioQuery = matchMedia(`(resolution: ${devicePixelRatio}dppx)`);
+  pixelRatioQuery.addEventListener('change', handlePixelRatioChange, { once: true });
+}
+
+function handlePixelRatioChange() {
+  watchPixelRatio();
+  scheduleResize();
+}
+
 function renderAt(samplePosition) {
+  // Some browsers miss resolution media-query events when moving between
+  // displays, so active playback also performs this scalar-only check.
+  if (!fixedRenderSize && devicePixelRatio !== measuredPixelRatio) resizeRenderer();
+
   const sample = Math.max(0, Math.min(EXIT_SAMPLE, Math.floor(samplePosition)));
   evaluateTimeline(sample, sync);
   evaluateInstrumentAges(sample, instrumentAges);
@@ -264,11 +360,17 @@ async function bootstrap() {
   // Let the branded launcher paint before mesh generation and shader compilation.
   await new Promise((resolve) => requestAnimationFrame(resolve));
 
-  const width = Number(query.get('width')) || undefined;
-  const height = Number(query.get('height')) || undefined;
-  const tessellation = Number(query.get('tessellation')) || undefined;
+  const tessellation = readPositiveInteger('tessellation') || undefined;
+  // Start no larger than the release size; the transactional resize below can
+  // then try higher-DPI targets without sacrificing its allocation fallback.
+  const initialSize = fixedRenderSize ?? measureCanvasRenderSize(RENDER_WIDTH, RENDER_HEIGHT);
 
-  renderer = new Renderer(canvas, { width, height, tessellation });
+  renderer = new Renderer(canvas, {
+    width: initialSize.width,
+    height: initialSize.height,
+    tessellation,
+  });
+  resizeRenderer();
 
   // A deterministic still-frame mode is useful for regression captures and
   // does not start the several-second procedural soundtrack render.
@@ -308,6 +410,10 @@ async function bootstrap() {
 
 startButton.addEventListener('click', begin);
 
+addEventListener('resize', scheduleResize);
+document.addEventListener('fullscreenchange', scheduleResize);
+watchPixelRatio();
+
 addEventListener('keydown', (event) => {
   if (event.repeat) return;
 
@@ -346,6 +452,8 @@ document.addEventListener('visibilitychange', () => {
 
 addEventListener('beforeunload', () => {
   stopAnimation();
+  cancelAnimationFrame(resizeFrame);
+  pixelRatioQuery?.removeEventListener('change', handlePixelRatioChange);
   unlockScreen();
   audio?.dispose();
   renderer?.dispose();
